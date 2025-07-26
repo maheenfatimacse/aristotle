@@ -53,6 +53,10 @@ export const AIPoweredWhiteboard = () => {
   const [showHints, setShowHints] = useState(false);
   const [showExplanation, setShowExplanation] = useState(false);
   const [inputMode, setInputMode] = useState<'typing' | 'handwriting'>('typing');
+  const [currentHint, setCurrentHint] = useState<string>("");
+  const [currentExplanation, setCurrentExplanation] = useState<string>("");
+  const [isLoadingHint, setIsLoadingHint] = useState(false);
+  const [isLoadingExplanation, setIsLoadingExplanation] = useState(false);
 
   // AI Validation Logic (Simulated)
   const validateStep = (step: string, questionText: string): ValidationResult => {
@@ -106,11 +110,84 @@ export const AIPoweredWhiteboard = () => {
     };
   };
 
+  // AI-powered step validation
+  const validateStepWithAI = async (step: string, question: string, previousSteps: string[]): Promise<ValidationResult> => {
+    const apiKey = import.meta.env.VITE_GOOGLE_API_KEY;
+    
+    if (!apiKey) {
+      throw new Error('API key not configured');
+    }
+
+    const prompt = `You are Aristotle, an AI math tutor. Validate this student's step in solving a math problem.
+
+Problem: ${question}
+Previous steps: ${previousSteps.length > 0 ? previousSteps.join(' → ') : 'None'}
+Current step: ${step}
+
+Analyze if this step is mathematically correct and appropriate for the problem. Consider:
+1. Mathematical accuracy
+2. Logical progression from previous steps
+3. Appropriate method for the problem type
+
+Return JSON with:
+{
+  "isCorrect": boolean,
+  "errorType": "syntax" | "calculation" | "conceptual" | null,
+  "feedback": "Specific feedback about the step (2-3 sentences)",
+  "encouragement": "Encouraging message (1 sentence)"
+}
+
+Be supportive but precise. If incorrect, explain why and guide toward the right approach.`;
+
+    try {
+      const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: prompt }] }]
+        })
+      });
+
+      if (!response.ok) {
+        throw new Error(`API Error: ${response.status}`);
+      }
+
+      const data = await response.json();
+      const resultText = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+      
+      // Extract JSON from the response (it might be wrapped in ```json```)
+      const jsonMatch = resultText.match(/```json\n([\s\S]*?)\n```/) || [null, resultText];
+      const jsonText = jsonMatch[1] || resultText;
+      
+      try {
+        const result = JSON.parse(jsonText);
+        return {
+          isCorrect: result.isCorrect || false,
+          errorType: result.errorType || null,
+          feedback: result.feedback || "I couldn't analyze this step properly.",
+          encouragement: result.encouragement || "Keep trying! You're learning."
+        };
+      } catch (parseError) {
+        // If JSON parsing fails, try to extract meaningful feedback
+        const isCorrect = resultText.toLowerCase().includes('correct') || resultText.toLowerCase().includes('right');
+        return {
+          isCorrect,
+          errorType: isCorrect ? null : 'calculation',
+          feedback: resultText.slice(0, 200) + (resultText.length > 200 ? '...' : ''),
+          encouragement: "Keep working through the problem step by step!"
+        };
+      }
+    } catch (error) {
+      console.error('AI validation failed:', error);
+      throw error;
+    }
+  };
+
   // Canvas drawing functions
   const setupCanvas = () => {
     const canvas = canvasRef.current;
     if (canvas) {
-      const ctx = canvas.getContext('2d');
+      const ctx = canvas.getContext('2d', { willReadFrequently: true });
       if (ctx) {
         ctx.strokeStyle = 'hsl(var(--primary))';
         ctx.lineWidth = 2;
@@ -180,8 +257,8 @@ export const AIPoweredWhiteboard = () => {
     }
   };
 
-  // Step validation handler
-  const handleStepValidation = () => {
+  // AI-powered step validation handler
+  const handleStepValidation = async () => {
     if (!currentStep.trim()) {
       toast({
         title: "Empty Step",
@@ -191,23 +268,50 @@ export const AIPoweredWhiteboard = () => {
       return;
     }
 
-    const validation = validateStep(currentStep, question.text);
-    const newStep: Step = {
-      id: Date.now().toString(),
-      content: currentStep,
-      validation,
-      timestamp: new Date()
-    };
-
-    setSteps(prev => [...prev, newStep]);
-    setCurrentStep("");
-    
-    // Show feedback toast
+    // Show loading state
     toast({
-      title: validation.isCorrect ? "Correct Step!" : "Step Needs Revision",
-      description: validation.feedback,
-      variant: validation.isCorrect ? "default" : "destructive"
+      title: "Validating...",
+      description: "Aristotle is checking your step...",
     });
+
+    try {
+      const validation = await validateStepWithAI(currentStep, question.text, steps.map(s => s.content));
+      
+      const newStep: Step = {
+        id: Date.now().toString(),
+        content: currentStep,
+        validation,
+        timestamp: new Date()
+      };
+
+      setSteps(prev => [...prev, newStep]);
+      setCurrentStep("");
+      
+      // Show feedback toast
+      toast({
+        title: validation.isCorrect ? "Correct Step! 🎉" : "Let's Refine This Step 📝",
+        description: validation.feedback,
+        variant: validation.isCorrect ? "default" : "destructive"
+      });
+    } catch (error) {
+      // Fallback to local validation if AI fails
+      const validation = validateStep(currentStep, question.text);
+      const newStep: Step = {
+        id: Date.now().toString(),
+        content: currentStep,
+        validation,
+        timestamp: new Date()
+      };
+
+      setSteps(prev => [...prev, newStep]);
+      setCurrentStep("");
+      
+      toast({
+        title: "Step Checked (Offline Mode)",
+        description: validation.feedback,
+        variant: validation.isCorrect ? "default" : "destructive"
+      });
+    }
   };
 
   // Image upload handler
@@ -225,21 +329,108 @@ export const AIPoweredWhiteboard = () => {
     }
   };
 
-  // Progressive hints
-  const getProgressiveHint = (stepNumber: number): string => {
-    const hints = [
-      "Start by identifying what operations need to be performed first.",
-      "Remember the order of operations: parentheses, exponents, multiplication/division, addition/subtraction.",
-      "Calculate (4)² first, then apply the negative sign.",
-      "Work from left to right for addition and subtraction of the same precedence."
-    ];
-    return hints[Math.min(stepNumber, hints.length - 1)];
+  // AI-powered contextual hints
+  const getContextualHint = async (question: string, currentSteps: string[], stepNumber: number): Promise<string> => {
+    const apiKey = import.meta.env.VITE_GOOGLE_API_KEY;
+    
+    if (!apiKey || !question.trim()) {
+      // Fallback to generic hints if no API or question
+      const fallbackHints = [
+        "Start by identifying what operations need to be performed first.",
+        "Remember the order of operations: parentheses, exponents, multiplication/division, addition/subtraction.",
+        "Look for patterns like factoring, completing the square, or using formulas.",
+        "Check your arithmetic carefully at each step."
+      ];
+      return fallbackHints[Math.min(stepNumber, fallbackHints.length - 1)];
+    }
+
+    const prompt = `You are Aristotle, a wise math tutor. A student is solving this problem: "${question}"
+
+Their progress so far:
+${currentSteps.length > 0 ? currentSteps.map((step, i) => `Step ${i + 1}: ${step}`).join('\n') : 'No steps taken yet'}
+
+They need a hint for their next step (Step ${stepNumber + 1}). Provide a helpful, specific hint that:
+1. Doesn't give away the answer
+2. Guides them toward the right approach
+3. Relates specifically to this problem type
+4. Encourages them to think through the process
+
+Return just the hint text (no JSON, no quotes), keep it concise but helpful.`;
+
+    try {
+      const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: prompt }] }]
+        })
+      });
+
+      if (!response.ok) throw new Error('API failed');
+
+      const data = await response.json();
+      const hintText = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+      
+      return hintText.trim() || "Think about what mathematical operation or property might help you move forward with this problem.";
+    } catch (error) {
+      console.error('Hint generation failed:', error);
+      return "Consider the type of equation you're solving and what methods typically work for this kind of problem.";
+    }
+  };
+
+  // AI-powered concept explanation
+  const getContextualExplanation = async (question: string, currentSteps: string[]): Promise<string> => {
+    const apiKey = import.meta.env.VITE_GOOGLE_API_KEY;
+    
+    if (!apiKey || !question.trim()) {
+      return `**General Mathematical Concepts:**
+
+Key problem-solving strategies:
+• **Identify the equation type** (linear, quadratic, etc.)
+• **Choose appropriate methods** (factoring, formula, graphing)
+• **Work systematically** through each step
+• **Check your work** by substituting back`;
+    }
+
+    const prompt = `You are Aristotle, a wise math tutor. A student is working on: "${question}"
+
+Their current progress:
+${currentSteps.length > 0 ? currentSteps.map((step, i) => `Step ${i + 1}: ${step}`).join('\n') : 'Just starting'}
+
+Provide a clear explanation of the key mathematical concepts involved in this specific problem. Include:
+
+1. **What type of problem this is** (e.g., quadratic equation, system of equations, etc.)
+2. **Key concepts/methods** relevant to solving it
+3. **Common approaches** students can use
+4. **Important things to remember** for this problem type
+
+Format with headers and bullet points. Be educational but encouraging.`;
+
+    try {
+      const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: prompt }] }]
+        })
+      });
+
+      if (!response.ok) throw new Error('API failed');
+
+      const data = await response.json();
+      const explanationText = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+      
+      return explanationText.trim() || "This problem involves applying fundamental mathematical principles. Take it step by step and think about what you know about this type of equation.";
+    } catch (error) {
+      console.error('Explanation generation failed:', error);
+      return "Focus on identifying the mathematical concepts in your problem and choose the most appropriate solving method.";
+    }
   };
 
   // [1] Add imports for image capture, VLM API call, and OCR fallback
   // [2] Add utility to capture a specific line from the canvas as an image
   const captureLineImage = (canvas: HTMLCanvasElement, lineIndex: number, lineHeight: number) => {
-    const ctx = canvas.getContext('2d');
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
     if (!ctx) return null;
     const y = lineIndex * lineHeight;
     const imageData = ctx.getImageData(0, y, canvas.width, lineHeight);
@@ -257,7 +448,7 @@ export const AIPoweredWhiteboard = () => {
   async function validateHandwrittenStepWithVLM(imageDataUrl: string, question: string, previousSteps: string[]) {
     const apiKey = import.meta.env.VITE_GOOGLE_API_KEY;
     // Example Gemini Pro Vision API endpoint (replace with actual endpoint)
-    const endpoint = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-pro-vision:generateContent?key=' + apiKey;
+    const endpoint = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=' + apiKey;
     const prompt = `Extract the handwritten math step from this image and validate it as part of the following problem.\nProblem: ${question}\nPrevious steps: ${previousSteps.join(' | ')}\nReturn JSON: {extractedStep, isCorrect, errorType, feedback, encouragement}`;
     const body = {
       contents: [
@@ -579,56 +770,122 @@ export const AIPoweredWhiteboard = () => {
           </div>
 
           {/* Text input for typing mode */}
-          <div className="space-y-3">
-            <div className="flex items-center gap-2">
-              <span className="text-sm font-medium">Step {steps.length + 1}:</span>
+          <div className="space-y-4">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <span className="text-lg font-semibold text-aristotle-blue">Step {steps.length + 1}:</span>
+                <Badge variant="secondary" className="bg-blue-100 text-blue-800">
+                  ✍️ Typing Mode
+                </Badge>
+              </div>
               <Button
-                variant="ghost"
+                variant="outline"
                 size="sm"
                 onClick={() => setInputMode(inputMode === 'typing' ? 'handwriting' : 'typing')}
+                className="border-gray-300"
               >
-                Switch to {inputMode === 'typing' ? 'Handwriting' : 'Typing'} Mode
+                🎨 Switch to {inputMode === 'typing' ? 'Handwriting' : 'Typing'} Mode
               </Button>
             </div>
             
-            <Textarea
-              value={currentStep}
-              onChange={(e) => {
-                setCurrentStep(e.target.value);
-                setInputMode('typing');
-              }}
-              placeholder="Type your solution step here... (e.g., '2x = 7 - 16 + 16')"
-              className="min-h-[80px] resize-none"
-            />
+            <div className="relative">
+              <Textarea
+                value={currentStep}
+                onChange={(e) => {
+                  setCurrentStep(e.target.value);
+                  setInputMode('typing');
+                }}
+                placeholder="Type your solution step here... (e.g., 'x² - 5x + 6 = 0' → '(x-2)(x-3) = 0')"
+                className="min-h-[120px] resize-none text-lg border-2 border-aristotle-blue/20 focus:border-aristotle-blue"
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' && e.ctrlKey && currentStep.trim()) {
+                    e.preventDefault();
+                    handleStepValidation();
+                  }
+                }}
+              />
+              <div className="absolute bottom-2 right-2 text-xs text-muted-foreground">
+                Press Ctrl+Enter to check step
+              </div>
+            </div>
             
-            <div className="flex items-center justify-between">
-              <div className="flex items-center gap-2">
+            {/* Action Buttons */}
+            <div className="space-y-3">
+              {/* Primary Check Step Button - Always Visible */}
+              <div className="flex justify-center">
                 <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={() => setShowHints(!showHints)}
+                  onClick={handleStepValidation}
+                  disabled={!currentStep.trim()}
+                  className="bg-aristotle-blue hover:bg-aristotle-blue/90 text-white px-8 py-3 text-lg font-semibold shadow-lg"
+                  size="lg"
                 >
-                  <HelpCircle className="h-4 w-4 mr-2" />
-                  Get Hint
-                </Button>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={() => setShowExplanation(!showExplanation)}
-                >
-                  <Lightbulb className="h-4 w-4 mr-2" />
-                  Explain Concept
+                  <CheckCircle className="h-5 w-5 mr-2" />
+                  🧠 Check Step with AI
                 </Button>
               </div>
               
-              <Button
-                onClick={handleStepValidation}
-                disabled={!currentStep.trim()}
-                className="bg-aristotle-blue hover:bg-aristotle-blue/90"
-              >
-                <CheckCircle className="h-4 w-4 mr-2" />
-                Check Step
-              </Button>
+              {/* Secondary Helper Buttons */}
+              <div className="flex items-center justify-center gap-3">
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={async () => {
+                    if (!showHints) {
+                      setShowHints(true);
+                      setIsLoadingHint(true);
+                      try {
+                        const hint = await getContextualHint(question.text, steps.map(s => s.content), steps.length);
+                        setCurrentHint(hint);
+                      } catch (error) {
+                        setCurrentHint("Think about what mathematical operation or property might help you move forward with this problem.");
+                      } finally {
+                        setIsLoadingHint(false);
+                      }
+                    } else {
+                      setShowHints(false);
+                    }
+                  }}
+                  className="border-learning-hint text-learning-hint hover:bg-learning-hint/10"
+                  disabled={!question.text.trim()}
+                >
+                  <HelpCircle className="h-4 w-4 mr-1" />
+                  💡 {isLoadingHint ? "Getting Hint..." : "Get Hint"}
+                </Button>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={async () => {
+                    if (!showExplanation) {
+                      setShowExplanation(true);
+                      setIsLoadingExplanation(true);
+                      try {
+                        const explanation = await getContextualExplanation(question.text, steps.map(s => s.content));
+                        setCurrentExplanation(explanation);
+                      } catch (error) {
+                        setCurrentExplanation("This problem involves applying fundamental mathematical principles. Take it step by step and think about what you know about this type of equation.");
+                      } finally {
+                        setIsLoadingExplanation(false);
+                      }
+                    } else {
+                      setShowExplanation(false);
+                    }
+                  }}
+                  className="border-wisdom-green text-wisdom-green hover:bg-wisdom-green/10"
+                  disabled={!question.text.trim()}
+                >
+                  <Lightbulb className="h-4 w-4 mr-1" />
+                  📚 {isLoadingExplanation ? "Loading..." : "Explain Concept"}
+                </Button>
+              </div>
+              
+              {/* Status Indicator */}
+              {currentStep.trim() && (
+                <div className="text-center">
+                  <p className="text-sm text-muted-foreground">
+                    ✍️ Ready to validate: "{currentStep.slice(0, 50)}{currentStep.length > 50 ? '...' : ''}"
+                  </p>
+                </div>
+              )}
             </div>
 
             {/* Hints Panel */}
@@ -639,7 +896,9 @@ export const AIPoweredWhiteboard = () => {
                     <HelpCircle className="h-5 w-5 text-learning-hint mt-0.5" />
                     <div>
                       <p className="font-medium text-learning-hint mb-1">💡 Hint:</p>
-                      <p className="text-sm text-foreground">{getProgressiveHint(steps.length)}</p>
+                      <p className="text-sm text-foreground">
+                        {isLoadingHint ? "🧠 Aristotle is thinking..." : currentHint || "Click 'Get Hint' to get contextual help for this problem."}
+                      </p>
                     </div>
                   </div>
                 </CardContent>
@@ -652,17 +911,20 @@ export const AIPoweredWhiteboard = () => {
                 <CardContent className="p-4">
                   <div className="flex items-start gap-2">
                     <Lightbulb className="h-5 w-5 text-wisdom-green mt-0.5" />
-                    <div>
-                      <p className="font-medium text-wisdom-green mb-1">📚 Concept Explanation:</p>
-                      <p className="text-sm text-foreground mb-2">
-                        <strong>Order of Operations (PEMDAS/BODMAS):</strong>
-                      </p>
-                      <ol className="text-sm text-foreground space-y-1 ml-4">
-                        <li>1. <strong>P</strong>arentheses/Brackets first</li>
-                        <li>2. <strong>E</strong>xponents/Orders (powers, roots)</li>
-                        <li>3. <strong>M</strong>ultiplication and <strong>D</strong>ivision (left to right)</li>
-                        <li>4. <strong>A</strong>ddition and <strong>S</strong>ubtraction (left to right)</li>
-                      </ol>
+                    <div className="flex-1">
+                      <p className="font-medium text-wisdom-green mb-2">📚 Concept Explanation:</p>
+                      <div className="text-sm text-foreground prose prose-sm max-w-none">
+                        {isLoadingExplanation ? (
+                          <div className="flex items-center gap-2">
+                            <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-wisdom-green"></div>
+                            <span>🧠 Aristotle is explaining the concepts...</span>
+                          </div>
+                        ) : (
+                          <div className="whitespace-pre-line">
+                            {currentExplanation || "Enter a math problem above to get contextual concept explanations."}
+                          </div>
+                        )}
+                      </div>
                     </div>
                   </div>
                 </CardContent>
